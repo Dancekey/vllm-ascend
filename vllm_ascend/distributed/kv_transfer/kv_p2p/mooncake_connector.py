@@ -1526,6 +1526,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
 
+    def is_idle_pp_step(self) -> bool:
+        """An empty payload carries no Mooncake worker updates."""
+        return not (self.requests or self.requests_to_send or self.reqs_in_batch)
+
     def add_new_req(
         self,
         request_id: str,
