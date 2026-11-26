@@ -2130,7 +2130,6 @@ class NPUModelRunner(GPUModelRunner):
             os.environ.get("AGY_PP0_SEND_BEFORE_KV_SAVE", "0") == "1"
             and not get_pp_group().is_last_rank
             and not self.broadcast_pp_output
-            and self.speculative_config is None
             and has_kv_transfer_group()
             and scheduler_output.kv_connector_metadata is not None
         )
@@ -2277,6 +2276,7 @@ class NPUModelRunner(GPUModelRunner):
             out.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
         finally:
             kv_connector.clear_connector_metadata()
+        self.kv_connector_output = out
         return out
 
     def _num_drafter_query_tokens(self) -> int:
