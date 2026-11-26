@@ -703,6 +703,10 @@ class NPUWorker(WorkerBase):
             output.tensors,
             all_gather_group=all_gather_group,
         )
+        if getattr(self.model_runner, "_pending_pp_kv_sched_output", None) is not None:
+            output.kv_connector_output = (
+                self.model_runner.complete_pp_deferred_kv_connector()
+            )
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:

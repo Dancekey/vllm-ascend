@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -2125,8 +2126,27 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        defer_pp_send_before_kv_save = (
+            os.environ.get("AGY_PP0_SEND_BEFORE_KV_SAVE", "0") == "1"
+            and not get_pp_group().is_last_rank
+            and not self.broadcast_pp_output
+            and self.speculative_config is None
+            and has_kv_transfer_group()
+            and scheduler_output.kv_connector_metadata is not None
+        )
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
+        )
+        self._pending_pp_kv_sched_output = (
+            scheduler_output if defer_pp_send_before_kv_save else None
+        )
+        kv_ctx = (
+            self._pp_deferred_kv_load_only(scheduler_output)
+            if defer_pp_send_before_kv_save
+            else self.maybe_get_kv_connector_output(
+                scheduler_output,
+                **({"defer_finalize": defer_kv_connector_finalize}),
+            )
         )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
         with (
@@ -2146,12 +2166,7 @@ class NPUModelRunner(GPUModelRunner):
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": defer_kv_connector_finalize}
-                ),
-            ) as kv_connector_output,
+            kv_ctx as kv_connector_output,
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
@@ -2229,6 +2244,40 @@ class NPUModelRunner(GPUModelRunner):
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
         return None
+
+    @contextmanager
+    def _pp_deferred_kv_load_only(self, scheduler_output: "SchedulerOutput"):
+        """Bind metadata and start KV loads before PP0 forward; defer save/poll."""
+        kv_connector = get_kv_transfer_group()
+        kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        kv_connector.start_load_kv(get_forward_context())
+        try:
+            yield None
+        except BaseException:
+            self._pending_pp_kv_sched_output = None
+            kv_connector.clear_connector_metadata()
+            raise
+
+    def complete_pp_deferred_kv_connector(self) -> KVConnectorOutput | None:
+        """Run wait_for_save and get_finished after PP0 launches isend_tensor_dict."""
+        sched_out = getattr(self, "_pending_pp_kv_sched_output", None)
+        if sched_out is None:
+            return None
+        self._pending_pp_kv_sched_output = None
+        kv_connector = get_kv_transfer_group()
+        out = KVConnectorOutput()
+        try:
+            kv_connector.wait_for_save()
+            out.finished_sending, out.finished_recving = kv_connector.get_finished(
+                sched_out.finished_req_ids
+            )
+            out.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+            out.kv_connector_stats = kv_connector.get_kv_connector_stats()
+            out.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+            out.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+        finally:
+            kv_connector.clear_connector_metadata()
+        return out
 
     def _num_drafter_query_tokens(self) -> int:
         """Return the maximum query width consumed by one drafter request."""
